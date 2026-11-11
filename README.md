@@ -65,12 +65,28 @@ left out, and clients that offer nothing else are refused.
 |---|---|
 | Versions | SSL 2.0 (off unless `MinVersion` is `VersionSSL20`), SSL 3.0, TLS 1.0 |
 | Key exchange | RSA, with a signed temporary key for export suites when the certificate's key is larger than they allow |
-| SSL 3.0 / TLS 1.0 suites | AES-128 and AES-256 CBC, 3DES, RC4-SHA, RC4-MD5, DES, EXP1024-RC4-SHA, EXP1024-DES, EXP-RC4-MD5, EXP-DES40 |
-| SSL 2.0 ciphers | DES-EDE3-CBC, RC4-128, DES-CBC, RC4-128-EXPORT40 (all with MD5) |
-| Extensions | secure renegotiation's empty `renegotiation_info` (TLS only), server name read |
+| SSL 3.0 / TLS 1.0 suites | AES-128 and AES-256 CBC, 3DES, RC4-SHA, RC4-MD5, IDEA, DES, EXP1024-RC4-SHA, EXP1024-DES, EXP-RC4-MD5, EXP-RC2-CBC-MD5, EXP-DES40 |
+| SSL 2.0 ciphers | DES-EDE3-CBC, RC4-128, IDEA-CBC, RC2-CBC, DES-CBC, RC4-128-EXPORT40, RC2-CBC-EXPORT40 (all with MD5) |
+| Session resumption | by session id, for all three versions, with `Config.SessionCache = retrossl.NewSessionCache(size, ttl)` |
+| Renegotiation | started by the client, or asked for with `Conn.RequestRenegotiation()` (SSL 3.0 and TLS); see below |
+| Compression | DEFLATE (RFC 3749), when `Config.Compression` is set |
+| Client certificates | `Config.ClientAuth`, `ClientCAs` and `VerifyPeerCertificate`, as in `crypto/tls`, for all three versions (RSA keys) |
+| Extensions | `renegotiation_info` (RFC 5746), server name read |
 
-There is no session resumption, renegotiation, compression, client
-certificate, RC2 or IDEA.
+**Renegotiation** is secure by default: clients that offered RFC 5746 in
+their first hello (most from 2010 on) may renegotiate, and others are told
+no. `RenegotiateInsecure` lets every client renegotiate, as servers did
+before 2009, which lets an attacker in the path put their own request in
+front of the client's (CVE-2009-3555). `RenegotiateNever` refuses all.
+
+**Compression** is off by default. Compressing before encrypting lets an
+attacker who can add to a client's requests learn its secrets, such as
+cookies (CRIME). Few old clients offered it anyway: mostly OpenSSL-based
+ones.
+
+**Client certificates** from SSL 2.0 clients come without a chain, so
+their issuer must be in `ClientCAs`. A resumed session keeps the client's
+certificate from its first handshake.
 
 **SSL 2.0 sends only the server's own certificate**, not its chain. An SSL
 2.0 client therefore has to trust that certificate or its direct issuer. With
@@ -84,10 +100,13 @@ check the mark, since it only falls back when the newer protocol is off.
 
 ## Testing
 
-`go test ./...` runs Go's own TLS client at TLS 1.0, and in-test clients for
-SSL 3.0 and TLS 1.0 (both hello formats, every suite) and SSL 2.0 (every
-cipher). The in-test clients follow the specifications, but they share the
-package's record code, so trying real old clients is still worth doing.
+`make test` (gofmt, vet, then `go test -race ./...`) runs Go's own TLS
+client at TLS 1.0, and in-test clients for SSL 3.0 and TLS 1.0 (both hello
+formats, every suite) and SSL 2.0 (every cipher), with resumption, renegotiation, compression and client
+certificates. IDEA is checked against its published test vector, RC2
+against OpenSSL, and the decompressor against records zlib compressed. The in-test clients follow the specifications, but they share the
+package's record code, so trying real old clients is still worth doing. `make cover`
+writes the tests' coverage to `cover.html`.
 
 ## Where it comes from
 
@@ -96,4 +115,7 @@ and is released here by the D-Modem authors under the BSD 3-Clause licence
 (see [LICENSE](LICENSE)), so that it can be used by BSD-licensed programs
 such as WebOne-go. SSL 3.0, SSL 2.0 and the export suites were written from
 the protocols' specifications: the SSL 3.0 draft (RFC 6101), the SSL 2.0
-draft, RFC 2246 and the 56-bit export draft.
+draft, RFC 2246, RFC 3749, RFC 5746 and the 56-bit export draft. IDEA was
+written from its paper. RC2 (`internal/rc2`) is copied from Go's
+`golang.org/x/crypto`, under its BSD licence (`internal/rc2/LICENSE`),
+because x/crypto keeps it internal.

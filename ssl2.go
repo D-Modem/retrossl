@@ -1,6 +1,7 @@
 package retrossl
 
 import (
+	"crypto"
 	"crypto/cipher"
 	"crypto/des"
 	"crypto/hmac"
@@ -9,9 +10,12 @@ import (
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"io"
 	"slices"
+
+	"github.com/D-Modem/retrossl/internal/idea"
 )
 
 // ssl2Cipher is an SSL 2.0 cipher kind.  Its MAC is always MD5.
@@ -24,12 +28,15 @@ type ssl2Cipher struct {
 	block     func(key []byte) (cipher.Block, error)
 }
 
-// ssl2Ciphers are those served, the best first.  (No RC2 or IDEA.)
+// ssl2Ciphers are those served, the best first.
 var ssl2Ciphers = []ssl2Cipher{
 	{0x0700c0, "SSL_CK_DES_192_EDE3_CBC_WITH_MD5", 24, 24, 8, des.NewTripleDESCipher},
 	{0x010080, "SSL_CK_RC4_128_WITH_MD5", 16, 16, 0, nil},
+	{0x050080, "SSL_CK_IDEA_128_CBC_WITH_MD5", 16, 16, 8, idea.NewCipher},
+	{0x030080, "SSL_CK_RC2_128_CBC_WITH_MD5", 16, 16, 8, newRC2},
 	{0x060040, "SSL_CK_DES_64_CBC_WITH_MD5", 8, 8, 8, des.NewCipher},
 	{0x020080, "SSL_CK_RC4_128_EXPORT40_WITH_MD5", 16, 5, 0, nil},
+	{0x040080, "SSL_CK_RC2_128_CBC_EXPORT40_WITH_MD5", 16, 5, 8, newRC2},
 }
 
 // SSL2CipherKinds are the SSL 2.0 cipher kinds served, the best first.
@@ -50,8 +57,14 @@ const (
 	ssl2ServerHello    = 4
 	ssl2ServerVerify   = 5
 	ssl2ServerFinished = 6
+	ssl2RequestCert    = 7
+	ssl2ClientCert     = 8
 
-	ssl2NoCipher = 0x0001
+	ssl2AuthMD5RSA = 1 // SSL_AT_MD5_WITH_RSA_ENCRYPTION
+
+	ssl2NoCipher       = 0x0001
+	ssl2NoCertificate  = 0x0002
+	ssl2BadCertificate = 0x0004
 
 	ssl2MaxData = 16000 // per record, under the 3-byte header's 16383 with MAC and padding
 )
@@ -188,52 +201,43 @@ func (c *Conn) handshake2(ch *clientHello, cert *tls.Certificate, key *rsa.Priva
 		c.writeError2(ssl2NoCipher)
 		return fail(0, "no SSL 2.0 cipher in common: the client offers %06x", ch.ssl2Kinds)
 	}
-	var specs []byte
-	for _, sc := range common {
-		specs = append(specs, byte(sc.kind>>16), byte(sc.kind>>8), byte(sc.kind))
-	}
-	connID := random(16)
 	leaf := cert.Certificate[0]
-	sh := []byte{ssl2ServerHello, 0, 1} // no session hit; an X.509 certificate
-	sh = binary.BigEndian.AppendUint16(sh, VersionSSL20)
-	sh = binary.BigEndian.AppendUint16(sh, uint16(len(leaf)))
-	sh = binary.BigEndian.AppendUint16(sh, uint16(len(specs)))
-	sh = binary.BigEndian.AppendUint16(sh, uint16(len(connID)))
-	sh = cat(sh, leaf, specs, connID)
-	if err := c.writeRecord2(sh); err != nil {
-		return err
-	}
+	c.serverLeaf = leaf
+	connID := random(16)
 
-	m, err := c.readMsg2(ssl2ClientMaster)
-	if err != nil {
-		return err
+	var sc ssl2Cipher
+	var master, arg []byte
+	sess := c.resumable2(ch, leaf, common)
+	if sess != nil {
+		// A session hit: no certificate, cipher or key exchange.
+		sh := []byte{ssl2ServerHello, 1, 0}
+		sh = binary.BigEndian.AppendUint16(sh, VersionSSL20)
+		sh = binary.BigEndian.AppendUint16(sh, 0)
+		sh = binary.BigEndian.AppendUint16(sh, 0)
+		sh = binary.BigEndian.AppendUint16(sh, uint16(len(connID)))
+		if err := c.writeRecord2(cat(sh, connID)); err != nil {
+			return err
+		}
+		i := slices.IndexFunc(common, func(x ssl2Cipher) bool { return x.kind == sess.suite })
+		sc, master, arg = common[i], sess.master, sess.keyArg
+	} else {
+		var specs []byte
+		for _, x := range common {
+			specs = append(specs, byte(x.kind>>16), byte(x.kind>>8), byte(x.kind))
+		}
+		sh := []byte{ssl2ServerHello, 0, 1} // no session hit; an X.509 certificate
+		sh = binary.BigEndian.AppendUint16(sh, VersionSSL20)
+		sh = binary.BigEndian.AppendUint16(sh, uint16(len(leaf)))
+		sh = binary.BigEndian.AppendUint16(sh, uint16(len(specs)))
+		sh = binary.BigEndian.AppendUint16(sh, uint16(len(connID)))
+		if err := c.writeRecord2(cat(sh, leaf, specs, connID)); err != nil {
+			return err
+		}
+		var err error
+		if sc, master, arg, err = c.readMasterKey2(common, key); err != nil {
+			return err
+		}
 	}
-	if len(m) < 10 {
-		return fail(0, "short CLIENT-MASTER-KEY")
-	}
-	kind := uint32(m[1])<<16 | uint32(m[2])<<8 | uint32(m[3])
-	u := func(i int) int { return int(binary.BigEndian.Uint16(m[i:])) }
-	clearLen, encLen, argLen := u(4), u(6), u(8)
-	if 10+clearLen+encLen+argLen != len(m) {
-		return fail(0, "bad CLIENT-MASTER-KEY")
-	}
-	i := slices.IndexFunc(common, func(sc ssl2Cipher) bool { return sc.kind == kind })
-	if i < 0 {
-		c.writeError2(ssl2NoCipher)
-		return fail(0, "the client chose cipher %06x, not offered", kind)
-	}
-	sc := common[i]
-	clear, enc, arg := m[10:10+clearLen], m[10+clearLen:10+clearLen+encLen], m[10+clearLen+encLen:]
-	if clearLen+sc.secretLen != sc.keyLen || argLen != sc.ivLen {
-		return fail(0, "CLIENT-MASTER-KEY's lengths are wrong for %s", sc.name)
-	}
-	// As for SSL 3.0: a bad decryption goes on with a random secret, and
-	// fails at CLIENT-FINISHED.
-	secret := random(sc.secretLen)
-	if err := rsa.DecryptPKCS1v15SessionKey(nil, key, enc, secret); err != nil {
-		return fail(0, "%v", err)
-	}
-	master := cat(clear, secret)
 
 	// Key material: MD5(master, "0", challenge, connection id), then "1"...
 	var km []byte
@@ -241,9 +245,10 @@ func (c *Conn) handshake2(ch *clientHello, cert *tls.Certificate, key *rsa.Priva
 		h := md5.Sum(cat(master, []byte{d}, ch.challenge, connID))
 		km = append(km, h[:]...)
 	}
+	km = km[:2*sc.keyLen]
 	// The client reads with the first key and writes with the second; the
 	// MAC secrets are the keys.
-	wk, rk := km[:sc.keyLen], km[sc.keyLen:2*sc.keyLen]
+	wk, rk := km[:sc.keyLen], km[sc.keyLen:]
 	c.in2.key, c.out2.key = rk, wk
 	if sc.ivLen == 0 {
 		c.in2.stream, _ = rc4.NewCipher(rk)
@@ -258,16 +263,117 @@ func (c *Conn) handshake2(ch *clientHello, cert *tls.Certificate, key *rsa.Priva
 	if err := c.writeRecord2(cat([]byte{ssl2ServerVerify}, ch.challenge)); err != nil {
 		return err
 	}
-	if m, err = c.readMsg2(ssl2ClientFinished); err != nil {
+	m, err := c.readMsg2(ssl2ClientFinished)
+	if err != nil {
 		return err
 	}
 	if subtle.ConstantTimeCompare(m[1:], connID) != 1 {
 		return fail(0, "the client's CLIENT-FINISHED is wrong")
 	}
-	if err := c.writeRecord2(cat([]byte{ssl2ServerFinished}, random(16))); err != nil {
+	var peer []*x509.Certificate
+	verified := false
+	if sess != nil {
+		peer, verified = sess.peer, sess.verified
+	} else if c.wantCert() {
+		if peer, verified, err = c.requestCertificate2(km); err != nil {
+			return err
+		}
+	}
+	sid := random(16)
+	if sess != nil {
+		sid = sess.id
+	}
+	if err := c.writeRecord2(cat([]byte{ssl2ServerFinished}, sid)); err != nil {
 		return err
 	}
+	if sess == nil {
+		c.cfg.SessionCache.put(&session{id: sid, version: VersionSSL20, suite: sc.kind, master: master,
+			keyArg: arg, cert: certHash(leaf), peer: peer, verified: verified})
+	}
 	c.transcript = nil
-	c.state = State{Version: VersionSSL20, CipherSuite: sc.kind, CipherName: sc.name, V2Hello: true}
+	c.state = State{Version: VersionSSL20, CipherSuite: sc.kind, CipherName: sc.name, V2Hello: true,
+		DidResume: sess != nil, PeerCertificates: peer}
 	return nil
+}
+
+// resumable2 is the SSL 2.0 session a hello asks for, if it can resume.
+func (c *Conn) resumable2(ch *clientHello, leaf []byte, common []ssl2Cipher) *session {
+	sess := c.cfg.SessionCache.get(ch.sessionID)
+	if sess == nil || sess.version != VersionSSL20 || sess.cert != certHash(leaf) ||
+		!slices.ContainsFunc(common, func(x ssl2Cipher) bool { return x.kind == sess.suite }) ||
+		(c.cfg.ClientAuth >= tls.VerifyClientCertIfGiven && !sess.verified) {
+		return nil
+	}
+	return sess
+}
+
+// readMasterKey2 reads CLIENT-MASTER-KEY: the cipher, master key and IV.
+func (c *Conn) readMasterKey2(common []ssl2Cipher, key *rsa.PrivateKey) (ssl2Cipher, []byte, []byte, error) {
+	var sc ssl2Cipher
+	m, err := c.readMsg2(ssl2ClientMaster)
+	if err != nil {
+		return sc, nil, nil, err
+	}
+	if len(m) < 10 {
+		return sc, nil, nil, fail(0, "short CLIENT-MASTER-KEY")
+	}
+	kind := uint32(m[1])<<16 | uint32(m[2])<<8 | uint32(m[3])
+	u := func(i int) int { return int(binary.BigEndian.Uint16(m[i:])) }
+	clearLen, encLen, argLen := u(4), u(6), u(8)
+	if 10+clearLen+encLen+argLen != len(m) {
+		return sc, nil, nil, fail(0, "bad CLIENT-MASTER-KEY")
+	}
+	i := slices.IndexFunc(common, func(x ssl2Cipher) bool { return x.kind == kind })
+	if i < 0 {
+		c.writeError2(ssl2NoCipher)
+		return sc, nil, nil, fail(0, "the client chose cipher %06x, not offered", kind)
+	}
+	sc = common[i]
+	clear, enc, arg := m[10:10+clearLen], m[10+clearLen:10+clearLen+encLen], m[10+clearLen+encLen:]
+	if clearLen+sc.secretLen != sc.keyLen || argLen != sc.ivLen {
+		return sc, nil, nil, fail(0, "CLIENT-MASTER-KEY's lengths are wrong for %s", sc.name)
+	}
+	// As for SSL 3.0: a bad decryption goes on with a random secret, and
+	// fails at CLIENT-FINISHED.
+	secret := random(sc.secretLen)
+	if err := rsa.DecryptPKCS1v15SessionKey(nil, key, enc, secret); err != nil {
+		return sc, nil, nil, fail(0, "%v", err)
+	}
+	return sc, cat(clear, secret), slices.Clone(arg), nil
+}
+
+// requestCertificate2 asks an SSL 2.0 client for its certificate: it
+// signs (MD5 with RSA) the key material, a challenge and the server's
+// certificate.
+func (c *Conn) requestCertificate2(km []byte) ([]*x509.Certificate, bool, error) {
+	chal := random(16)
+	if err := c.writeRecord2(cat([]byte{ssl2RequestCert, ssl2AuthMD5RSA}, chal)); err != nil {
+		return nil, false, err
+	}
+	m, err := c.readRecord2()
+	if err != nil {
+		return nil, false, err
+	}
+	if len(m) == 3 && m[0] == ssl2Error && binary.BigEndian.Uint16(m[1:]) == ssl2NoCertificate {
+		return c.checkPeer(nil)
+	}
+	if len(m) < 6 || m[0] != ssl2ClientCert || m[1] != 1 {
+		return nil, false, fail(0, "SSL 2.0 message %x, not CLIENT-CERTIFICATE", m[:min(len(m), 2)])
+	}
+	certLen, respLen := int(binary.BigEndian.Uint16(m[2:])), int(binary.BigEndian.Uint16(m[4:]))
+	if 6+certLen+respLen != len(m) {
+		return nil, false, fail(0, "bad CLIENT-CERTIFICATE")
+	}
+	der, resp := m[6:6+certLen], m[6+certLen:]
+	peer, verified, err := c.checkPeer([][]byte{slices.Clone(der)})
+	if err != nil {
+		c.writeError2(ssl2BadCertificate)
+		return nil, false, err
+	}
+	sum := md5.Sum(cat(km, chal, c.serverLeaf))
+	if err := rsa.VerifyPKCS1v15(peer[0].PublicKey.(*rsa.PublicKey), crypto.MD5, sum[:], resp); err != nil {
+		c.writeError2(ssl2BadCertificate)
+		return nil, false, fail(0, "the client's CLIENT-CERTIFICATE signature is wrong")
+	}
+	return peer, verified, nil
 }
