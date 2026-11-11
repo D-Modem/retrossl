@@ -10,6 +10,9 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"hash"
+
+	"github.com/D-Modem/retrossl/internal/idea"
+	"github.com/D-Modem/retrossl/internal/rc2"
 )
 
 // suite is an SSL 3.0 / TLS 1.0 cipher suite: RSA key exchange, then a
@@ -34,12 +37,19 @@ var suites = []suite{
 	{0x000a, "TLS_RSA_WITH_3DES_EDE_CBC_SHA", 24, 24, 8, 20, 0, des.NewTripleDESCipher, sha1.New},
 	{0x0005, "TLS_RSA_WITH_RC4_128_SHA", 16, 16, 0, 20, 0, nil, sha1.New},
 	{0x0004, "TLS_RSA_WITH_RC4_128_MD5", 16, 16, 0, 16, 0, nil, md5.New},
+	{0x0007, "TLS_RSA_WITH_IDEA_CBC_SHA", 16, 16, 8, 20, 0, idea.NewCipher, sha1.New},
 	{0x0009, "TLS_RSA_WITH_DES_CBC_SHA", 8, 8, 8, 20, 0, des.NewCipher, sha1.New},
 	{0x0064, "TLS_RSA_EXPORT1024_WITH_RC4_56_SHA", 7, 16, 0, 20, 1024, nil, sha1.New},
 	{0x0062, "TLS_RSA_EXPORT1024_WITH_DES_CBC_SHA", 7, 8, 8, 20, 1024, des.NewCipher, sha1.New},
 	{0x0003, "TLS_RSA_EXPORT_WITH_RC4_40_MD5", 5, 16, 0, 16, 512, nil, md5.New},
+	{0x0006, "TLS_RSA_EXPORT_WITH_RC2_CBC_40_MD5", 5, 16, 8, 16, 512, newRC2, md5.New},
 	{0x0008, "TLS_RSA_EXPORT_WITH_DES40_CBC_SHA", 5, 8, 8, 20, 512, des.NewCipher, sha1.New},
 }
+
+// newRC2 is RC2 as SSL uses it: a 16-byte key, all 128 bits effective
+// (OpenSSL's rc2-cbc; the export suites' strength is in the key's
+// derivation).
+func newRC2(key []byte) (cipher.Block, error) { return rc2.New(key, len(key)*8) }
 
 func suiteByID(id uint16) *suite {
 	for i := range suites {
@@ -78,6 +88,8 @@ type half struct {
 	mac     hash.Hash        // TLS: an HMAC; SSL 3.0: the bare hash
 	block   cipher.BlockMode // CBC; its IV chains from record to record
 	stream  cipher.Stream    // or RC4
+	comp    *compressor      // DEFLATE, when agreed (sending)
+	decomp  *decompressor    // (receiving)
 }
 
 // dirKeys are one direction's MAC secret, key and IV.
@@ -85,8 +97,15 @@ type dirKeys struct{ mac, key, iv []byte }
 
 // newHalf is a direction's protection from its keys (enc: the sending
 // side).
-func (s *suite) newHalf(v uint16, k dirKeys, enc bool) half {
+func (s *suite) newHalf(v uint16, k dirKeys, enc bool, comp uint8) half {
 	h := half{version: v}
+	if comp == compDeflate {
+		if enc {
+			h.comp = newCompressor()
+		} else {
+			h.decomp = &decompressor{}
+		}
+	}
 	if v == VersionSSL30 {
 		h.ssl3, h.macKey, h.mac = true, k.mac, s.hash()
 	} else {
@@ -141,6 +160,9 @@ func (h *half) seal(typ uint8, plain []byte) []byte {
 	if h.mac == nil {
 		out = append(out, plain...)
 	} else {
+		if h.comp != nil {
+			plain = h.comp.compress(plain)
+		}
 		body := append(append(make([]byte, 0, len(plain)+64), plain...), h.macOf(typ, plain)...)
 		h.seq++
 		if h.block != nil {
@@ -159,9 +181,22 @@ func (h *half) seal(typ uint8, plain []byte) []byte {
 	return out
 }
 
-// open is a record's plaintext, in place; ok false: its MAC or padding is
-// wrong.  A bad padding is still MACed, so the two fail alike.
+// open is a record's plaintext; ok false: its MAC or padding (or its
+// compression) is wrong.
 func (h *half) open(typ uint8, body []byte) (plain []byte, ok bool) {
+	plain, ok = h.unseal(typ, body)
+	if ok && h.decomp != nil {
+		var err error
+		if plain, err = h.decomp.decompress(plain, maxPlain); err != nil {
+			return nil, false
+		}
+	}
+	return plain, ok
+}
+
+// unseal is a record's (compressed) plaintext, in place.  A bad padding
+// is still MACed, so the two fail alike.
+func (h *half) unseal(typ uint8, body []byte) (plain []byte, ok bool) {
 	if h.mac == nil {
 		return body, true
 	}
@@ -306,6 +341,20 @@ func finished(v uint16, ms, transcript []byte, client bool) []byte {
 		if client {
 			sender = "CLNT"
 		}
+		return ssl3Hash(ms, transcript, sender)
+	}
+	label := "server finished"
+	if client {
+		label = "client finished"
+	}
+	m, s := md5.Sum(transcript), sha1.Sum(transcript)
+	return prf10(ms, label, cat(m[:], s[:]), 12)
+}
+
+// ssl3Hash is SSL 3.0's MD5 and SHA-1 of a transcript, keyed by the master
+// secret: Finished's (with its sender) and CertificateVerify's (without).
+func ssl3Hash(ms, transcript []byte, sender string) []byte {
+	{
 		out := make([]byte, 0, 36)
 		for _, h := range []hash.Hash{md5.New(), sha1.New()} {
 			n := padLen(h)
@@ -322,10 +371,4 @@ func finished(v uint16, ms, transcript []byte, client bool) []byte {
 		}
 		return out
 	}
-	label := "server finished"
-	if client {
-		label = "client finished"
-	}
-	m, s := md5.Sum(transcript), sha1.Sum(transcript)
-	return prf10(ms, label, cat(m[:], s[:]), 12)
 }

@@ -16,6 +16,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -160,15 +161,31 @@ func TestFrontendModern(t *testing.T) {
 }
 
 // oldClient is an SSL 3.0 / TLS 1.0 client, built on the package's own
-// record layer.
+// record layer.  Its fields before the blank line are options.
 type oldClient struct {
-	t          *testing.T
-	c          Conn
-	transcript []byte
-	tempKey    bool // the server sent a ServerKeyExchange
+	t           *testing.T
+	v, id       uint16
+	v2          bool             // open with an SSL 2.0-format hello
+	badFinished bool             // send a wrong Finished
+	secure      bool             // offer secure renegotiation
+	comp        bool             // offer DEFLATE
+	sessionID   []byte           // ask to resume this session
+	cert        *tls.Certificate // send this when asked (nil: none)
+
+	c                          Conn
+	transcript                 []byte
+	tempKey                    bool // the server sent a ServerKeyExchange
+	certRequested, resumed     bool
+	gotSID, ms                 []byte
+	clientVerify, serverVerify []byte
+	compMethod                 uint8
 }
 
 func v2Hello(version uint16, suites []uint16, kinds []uint32, challenge []byte) []byte {
+	return v2HelloSID(version, suites, kinds, nil, challenge)
+}
+
+func v2HelloSID(version uint16, suites []uint16, kinds []uint32, sid, challenge []byte) []byte {
 	var specs []byte
 	for _, k := range kinds {
 		specs = append(specs, byte(k>>16), byte(k>>8), byte(k))
@@ -178,41 +195,62 @@ func v2Hello(version uint16, suites []uint16, kinds []uint32, challenge []byte) 
 	}
 	m := binary.BigEndian.AppendUint16([]byte{1}, version)
 	m = binary.BigEndian.AppendUint16(m, uint16(len(specs)))
-	m = binary.BigEndian.AppendUint16(m, 0)
+	m = binary.BigEndian.AppendUint16(m, uint16(len(sid)))
 	m = binary.BigEndian.AppendUint16(m, uint16(len(challenge)))
-	m = append(append(m, specs...), challenge...)
+	m = append(append(append(m, specs...), sid...), challenge...)
 	return append([]byte{0x80 | byte(len(m)>>8), byte(len(m))}, m...)
 }
 
-// handshake runs the client's side, offering version v and suite id, in
-// an SSL 2.0-format hello if v2; a wrong Finished if badFinished.
-func (o *oldClient) handshake(nc net.Conn, v, id uint16, v2, badFinished bool) error {
-	t := o.t
-	c := &o.c
-	c.Conn, c.br = nc, bufio.NewReader(nc)
-	c.out.version = v
+// handshake runs the client's first handshake on nc.
+func (o *oldClient) handshake(nc net.Conn) error {
+	o.c.Conn, o.c.br = nc, bufio.NewReader(nc)
+	o.c.out.version = o.v
+	return o.run(true)
+}
+
+// renegotiate runs another handshake on the connection.
+func (o *oldClient) renegotiate() error { return o.run(false) }
+
+func (o *oldClient) run(first bool) error {
+	t, c, v := o.t, &o.c, o.v
+	o.transcript, o.resumed, o.certRequested, o.tempKey = nil, false, false, false
 	cr := random(32)
-	offer := []uint16{id}
-	if v == VersionTLS10 {
-		offer = append(offer, 0x00ff)
-	}
-	if v2 {
+	if o.v2 && first {
+		offer := []uint16{o.id}
+		if o.secure {
+			offer = append(offer, 0x00ff)
+		}
 		chal := random(16)
 		copy(cr, make([]byte, 16))
 		copy(cr[16:], chal)
 		hello := v2Hello(v, offer, []uint32{0x010080}, chal)
 		o.transcript = append(o.transcript, hello[2:]...)
-		if _, err := nc.Write(hello); err != nil {
+		if _, err := c.Conn.Write(hello); err != nil {
 			return err
 		}
 	} else {
+		offer := []uint16{o.id}
+		if o.secure && first {
+			offer = append(offer, 0x00ff)
+		}
 		body := binary.BigEndian.AppendUint16(nil, v)
-		body = append(append(body, cr...), 0)
+		body = append(body, cr...)
+		body = append(append(body, byte(len(o.sessionID))), o.sessionID...)
 		body = binary.BigEndian.AppendUint16(body, uint16(2*len(offer)))
 		for _, s := range offer {
 			body = binary.BigEndian.AppendUint16(body, s)
 		}
-		hello := msg(hsClientHello, append(body, 1, 0))
+		if o.comp {
+			body = append(body, 2, 1, 0)
+		} else {
+			body = append(body, 1, 0)
+		}
+		if o.secure && !first {
+			ri := append([]byte{byte(len(o.clientVerify))}, o.clientVerify...)
+			ext := appendVec16([]byte{0xff, 0x01}, ri)
+			body = appendVec16(body, ext)
+		}
+		hello := msg(hsClientHello, body)
 		o.transcript = append(o.transcript, hello...)
 		if err := c.writeRecord(recHandshake, hello); err != nil {
 			return err
@@ -225,14 +263,42 @@ func (o *oldClient) handshake(nc net.Conn, v, id uint16, v2, badFinished bool) e
 	if sh[0] != hsServerHello || binary.BigEndian.Uint16(sh[4:]) != v {
 		t.Fatalf("server hello %x", sh)
 	}
-	sr := sh[6:38]
-	if got := binary.BigEndian.Uint16(sh[39:]); got != id {
+	r := &reader{b: sh[6:]}
+	sr := slices.Clone(r.take(32))
+	sid := slices.Clone(r.take(r.u8()))
+	if got := uint16(r.u16()); got != o.id {
 		t.Fatalf("suite %04x", got)
 	}
-	if hasReneg := bytes.HasSuffix(sh, []byte{0xff, 0x01, 0, 1, 0}); hasReneg != (v == VersionTLS10) {
-		t.Errorf("renegotiation_info %v at %x", hasReneg, v)
+	o.compMethod = uint8(r.u8())
+	var renegInfo []byte
+	hasReneg := false
+	if len(r.b) > 0 {
+		ext := &reader{b: r.take(r.u16())}
+		for len(ext.b) > 0 && !ext.bad {
+			typ, data := ext.u16(), ext.take(ext.u16())
+			if typ == 0xff01 {
+				hasReneg, renegInfo = true, data[1:]
+			}
+		}
+	}
+	if hasReneg != o.secure {
+		t.Errorf("renegotiation_info %v", hasReneg)
+	} else if hasReneg && !bytes.Equal(renegInfo, cat(o.clientVerify, o.serverVerify)) {
+		t.Errorf("renegotiation_info %x", renegInfo)
 	}
 	o.transcript = append(o.transcript, sh...)
+	s := suiteByID(o.id)
+
+	if len(o.sessionID) > 0 && bytes.Equal(sid, o.sessionID) { // resumed
+		o.resumed = true
+		ck, sk := s.keys(v, o.ms, cr, sr)
+		if err := o.readServerFinished(s, sk); err != nil {
+			return err
+		}
+		return o.sendFinished(s, ck, nil)
+	}
+	o.gotSID = sid
+
 	ce, err := c.readHandshake()
 	if err != nil {
 		return err
@@ -267,10 +333,34 @@ func (o *oldClient) handshake(nc net.Conn, v, id uint16, v2, badFinished bool) e
 		}
 		o.transcript = append(o.transcript, m...)
 	}
+	if m[0] == hsCertificateRequest {
+		o.certRequested = true
+		if m, err = c.readHandshake(); err != nil {
+			return err
+		}
+		o.transcript = append(o.transcript, m...)
+	}
 	if m[0] != hsServerDone {
 		t.Fatalf("server hello done %x", m)
 	}
 
+	var flight []byte
+	if o.certRequested {
+		switch {
+		case o.cert != nil:
+			var chain []byte
+			for _, der := range o.cert.Certificate {
+				chain = append(appendU24(chain, len(der)), der...)
+			}
+			flight = msg(hsCertificate, appendU24(nil, len(chain)), chain...)
+		case v == VersionSSL30:
+			if err := c.writeRecord(recAlert, []byte{levelWarning, alertNoCertificate}); err != nil {
+				return err
+			}
+		default:
+			flight = msg(hsCertificate, appendU24(nil, 0))
+		}
+	}
 	pre := random(48)
 	binary.BigEndian.PutUint16(pre, v)
 	ct, err := rsa.EncryptPKCS1v15(rand.Reader, pub, pre)
@@ -280,27 +370,53 @@ func (o *oldClient) handshake(nc net.Conn, v, id uint16, v2, badFinished bool) e
 	if v == VersionTLS10 {
 		ct = appendVec16(nil, ct)
 	}
-	cke := msg(hsClientKeyExchange, ct)
-	o.transcript = append(o.transcript, cke...)
-	ms := masterSecret(v, pre, cr, sr)
-	s := suiteByID(id)
-	ck, sk := s.keys(v, ms, cr, sr)
-	fin := finished(v, ms, o.transcript, true)
-	if badFinished {
+	flight = append(flight, msg(hsClientKeyExchange, ct)...)
+	o.transcript = append(o.transcript, flight...)
+	o.ms = masterSecret(v, pre, cr, sr)
+	if o.certRequested && o.cert != nil {
+		var digest []byte
+		if v == VersionSSL30 {
+			digest = ssl3Hash(o.ms, o.transcript, "")
+		} else {
+			h5, h1 := md5.Sum(o.transcript), sha1.Sum(o.transcript)
+			digest = cat(h5[:], h1[:])
+		}
+		sig, err := rsa.SignPKCS1v15(rand.Reader, o.cert.PrivateKey.(*rsa.PrivateKey), crypto.MD5SHA1, digest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cv := msg(hsCertificateVerify, appendVec16(nil, sig))
+		o.transcript = append(o.transcript, cv...)
+		flight = append(flight, cv...)
+	}
+	ck, sk := s.keys(v, o.ms, cr, sr)
+	if err := c.writeRecord(recHandshake, flight); err != nil {
+		return err
+	}
+	if err := o.sendFinished(s, ck, nil); err != nil {
+		return err
+	}
+	return o.readServerFinished(s, sk)
+}
+
+func (o *oldClient) sendFinished(s *suite, ck dirKeys, _ []byte) error {
+	c := &o.c
+	fin := finished(o.v, o.ms, o.transcript, true)
+	o.clientVerify = slices.Clone(fin)
+	if o.badFinished {
 		fin[0] ^= 1
 	}
 	finMsg := msg(hsFinished, fin)
 	o.transcript = append(o.transcript, finMsg...)
-	if err := c.writeRecord(recHandshake, cke); err != nil {
-		return err
-	}
 	if err := c.writeRecord(recCCS, []byte{1}); err != nil {
 		return err
 	}
-	c.out = s.newHalf(v, ck, true)
-	if err := c.writeRecord(recHandshake, finMsg); err != nil {
-		return err
-	}
+	c.out = s.newHalf(o.v, ck, true, o.compMethod)
+	return c.writeRecord(recHandshake, finMsg)
+}
+
+func (o *oldClient) readServerFinished(s *suite, sk dirKeys) error {
+	c := &o.c
 	typ, data, err := c.readRecord()
 	if err != nil {
 		return err
@@ -309,17 +425,41 @@ func (o *oldClient) handshake(nc net.Conn, v, id uint16, v2, badFinished bool) e
 		return alertIn(data)
 	}
 	if typ != recCCS {
-		t.Fatalf("record %d, not CCS", typ)
+		o.t.Fatalf("record %d, not CCS", typ)
 	}
-	c.in = s.newHalf(v, sk, false)
+	c.in = s.newHalf(o.v, sk, false, o.compMethod)
 	sf, err := c.readHandshake()
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(sf[4:], finished(v, ms, o.transcript, false)) {
-		t.Fatalf("server Finished wrong")
+	want := finished(o.v, o.ms, o.transcript, false)
+	if !bytes.Equal(sf[4:], want) {
+		o.t.Fatalf("server Finished wrong")
 	}
+	o.serverVerify = want
+	o.transcript = append(o.transcript, sf...)
 	return nil
+}
+
+// echoCheck sends data and checks it comes back.
+func (o *oldClient) echoCheck(t *testing.T, n int) {
+	t.Helper()
+	c := &o.c
+	want := bytes.Repeat([]byte("hello "), n)
+	if err := c.writeRecord(recData, want); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	for len(got) < len(want) {
+		typ, data, err := c.readRecord()
+		if err != nil || typ != recData {
+			t.Fatalf("record %d %x: %v", typ, data, err)
+		}
+		got = append(got, data...)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("echo differs")
+	}
 }
 
 func dial(t *testing.T, addr string) net.Conn {
@@ -342,8 +482,8 @@ func TestOldClients(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/v2=%v/%s", VersionName(v), v2, s.name), func(t *testing.T) {
 					// A TLS 1.0 record hello is crypto/tls's, through Frontend.
 					addr, errs, states := echoBy(t, Config{}, v == VersionSSL30 || v2)
-					o := &oldClient{t: t}
-					if err := o.handshake(dial(t, addr), v, s.id, v2, false); err != nil {
+					o := &oldClient{t: t, v: v, id: s.id, v2: v2, secure: v == VersionTLS10}
+					if err := o.handshake(dial(t, addr)); err != nil {
 						t.Fatal(err)
 					}
 					if o.tempKey != (s.export != 0) {
@@ -353,23 +493,8 @@ func TestOldClients(t *testing.T) {
 					if st.Version != v || st.CipherSuite != uint32(s.id) || st.V2Hello != v2 {
 						t.Errorf("state %+v", st)
 					}
-					c := &o.c
-					want := bytes.Repeat([]byte("hello "), 5000)
-					if err := c.writeRecord(recData, want); err != nil {
-						t.Fatal(err)
-					}
-					var got []byte
-					for len(got) < len(want) {
-						typ, data, err := c.readRecord()
-						if err != nil || typ != recData {
-							t.Fatalf("record %d: %v", typ, err)
-						}
-						got = append(got, data...)
-					}
-					if !bytes.Equal(got, want) {
-						t.Fatal("echo differs")
-					}
-					c.sendAlert(levelWarning, alertCloseNotify)
+					o.echoCheck(t, 5000)
+					o.c.sendAlert(levelWarning, alertCloseNotify)
 					if err := <-errs; err != nil {
 						t.Errorf("server: %v", err)
 					}
@@ -383,8 +508,8 @@ func TestOldClients(t *testing.T) {
 func TestBadFinished(t *testing.T) {
 	for _, v := range []uint16{VersionSSL30, VersionTLS10} {
 		addr, errs, _ := echoBy(t, Config{}, false)
-		o := &oldClient{t: t}
-		if err := o.handshake(dial(t, addr), v, 0x002f, false, true); err == nil {
+		o := &oldClient{t: t, v: v, id: 0x002f, badFinished: true}
+		if err := o.handshake(dial(t, addr)); err == nil {
 			t.Fatal("handshake passed")
 		}
 		if err := <-errs; err == nil {
@@ -408,12 +533,40 @@ func TestSSL3Off(t *testing.T) {
 	}
 }
 
-// ssl2Client runs SSL 2.0's client side with cipher kind; offer is what
-// the hello offers (version and kinds).
+// ssl2Opts are an SSL 2.0 test client's options.
+type ssl2Opts struct {
+	version uint16
+	kind    uint32
+	suites  []uint16         // SSL 3.0 / TLS suites offered too
+	resume  *ssl2Result      // a session to resume
+	cert    *tls.Certificate // sent when asked
+}
+
+// ssl2Result is a finished SSL 2.0 client handshake.
+type ssl2Result struct {
+	c                  *Conn
+	sid, master, arg   []byte
+	hit, certRequested bool
+}
+
 func ssl2Client(t *testing.T, nc net.Conn, version uint16, kind uint32, suites []uint16) (*Conn, error) {
+	r, err := ssl2Run(t, nc, ssl2Opts{version: version, kind: kind, suites: suites})
+	if err != nil {
+		return nil, err
+	}
+	return r.c, nil
+}
+
+// ssl2Run runs SSL 2.0's client side.
+func ssl2Run(t *testing.T, nc net.Conn, o ssl2Opts) (*ssl2Result, error) {
 	c := &Conn{Conn: nc, br: bufio.NewReader(nc), ssl2: true}
+	res := &ssl2Result{c: c}
 	chal := random(16)
-	if _, err := nc.Write(v2Hello(version, suites, SSL2CipherKinds(), chal)); err != nil {
+	var sid []byte
+	if o.resume != nil {
+		sid = o.resume.sid
+	}
+	if _, err := nc.Write(v2HelloSID(o.version, o.suites, SSL2CipherKinds(), sid, chal)); err != nil {
 		return nil, err
 	}
 	c.out2.seq = 1
@@ -425,43 +578,56 @@ func ssl2Client(t *testing.T, nc net.Conn, version uint16, kind uint32, suites [
 		return nil, fmt.Errorf("SSL 2.0 error %x", sh)
 	}
 	u := func(i int) int { return int(binary.BigEndian.Uint16(sh[i:])) }
-	if sh[0] != ssl2ServerHello || sh[1] != 0 || sh[2] != 1 || u(3) != VersionSSL20 {
+	if sh[0] != ssl2ServerHello || u(3) != VersionSSL20 {
 		t.Fatalf("server hello %x", sh[:11])
 	}
 	certLen, specLen, idLen := u(5), u(7), u(9)
-	pc, err := x509.ParseCertificate(sh[11 : 11+certLen])
-	if err != nil {
-		t.Fatal(err)
-	}
-	specs, connID := sh[11+certLen:11+certLen+specLen], sh[11+certLen+specLen:]
-	if len(connID) != idLen || !bytes.Contains(specs, []byte{byte(kind >> 16), byte(kind >> 8), byte(kind)}) {
-		t.Fatalf("specs %x, connection id %x", specs, connID)
+	serverCert := sh[11 : 11+certLen]
+	connID := sh[11+certLen+specLen:]
+	if len(connID) != idLen {
+		t.Fatalf("connection id %x", connID)
 	}
 	var sc ssl2Cipher
 	for _, x := range ssl2Ciphers {
-		if x.kind == kind {
+		if x.kind == o.kind {
 			sc = x
 		}
 	}
-	master, arg := random(sc.keyLen), random(sc.ivLen)
-	clearLen := sc.keyLen - sc.secretLen
-	enc, err := rsa.EncryptPKCS1v15(rand.Reader, pc.PublicKey.(*rsa.PublicKey), master[clearLen:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmk := []byte{ssl2ClientMaster, byte(kind >> 16), byte(kind >> 8), byte(kind)}
-	cmk = binary.BigEndian.AppendUint16(cmk, uint16(clearLen))
-	cmk = binary.BigEndian.AppendUint16(cmk, uint16(len(enc)))
-	cmk = binary.BigEndian.AppendUint16(cmk, uint16(len(arg)))
-	if err := c.writeRecord2(cat(cmk, master[:clearLen], enc, arg)); err != nil {
-		return nil, err
+	if sh[1] == 1 { // a session hit
+		if o.resume == nil || certLen != 0 || specLen != 0 {
+			t.Fatalf("session hit %x", sh[:11])
+		}
+		res.hit, res.master, res.arg = true, o.resume.master, o.resume.arg
+	} else {
+		pc, err := x509.ParseCertificate(serverCert)
+		if err != nil {
+			t.Fatal(err)
+		}
+		specs := sh[11+certLen : 11+certLen+specLen]
+		if !bytes.Contains(specs, []byte{byte(o.kind >> 16), byte(o.kind >> 8), byte(o.kind)}) {
+			t.Fatalf("specs %x", specs)
+		}
+		res.master, res.arg = random(sc.keyLen), random(sc.ivLen)
+		clearLen := sc.keyLen - sc.secretLen
+		enc, err := rsa.EncryptPKCS1v15(rand.Reader, pc.PublicKey.(*rsa.PublicKey), res.master[clearLen:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmk := []byte{ssl2ClientMaster, byte(o.kind >> 16), byte(o.kind >> 8), byte(o.kind)}
+		cmk = binary.BigEndian.AppendUint16(cmk, uint16(clearLen))
+		cmk = binary.BigEndian.AppendUint16(cmk, uint16(len(enc)))
+		cmk = binary.BigEndian.AppendUint16(cmk, uint16(len(res.arg)))
+		if err := c.writeRecord2(cat(cmk, res.master[:clearLen], enc, res.arg)); err != nil {
+			return nil, err
+		}
 	}
 	var km []byte
 	for d := byte('0'); len(km) < 2*sc.keyLen; d++ {
-		h := md5.Sum(cat(master, []byte{d}, chal, connID))
+		h := md5.Sum(cat(res.master, []byte{d}, chal, connID))
 		km = append(km, h[:]...)
 	}
-	rk, wk := km[:sc.keyLen], km[sc.keyLen:2*sc.keyLen]
+	km = km[:2*sc.keyLen]
+	rk, wk := km[:sc.keyLen], km[sc.keyLen:]
 	c.in2.key, c.out2.key = rk, wk
 	if sc.ivLen == 0 {
 		c.in2.stream, _ = rc4NewCipher(rk)
@@ -469,7 +635,7 @@ func ssl2Client(t *testing.T, nc net.Conn, version uint16, kind uint32, suites [
 	} else {
 		rb, _ := sc.block(rk)
 		wb, _ := sc.block(wk)
-		c.in2.block, c.out2.block = cbcDecrypter(rb, arg), cbcEncrypter(wb, arg)
+		c.in2.block, c.out2.block = cbcDecrypter(rb, res.arg), cbcEncrypter(wb, res.arg)
 	}
 	if err := c.writeRecord2(cat([]byte{ssl2ClientFinished}, connID)); err != nil {
 		return nil, err
@@ -485,10 +651,39 @@ func ssl2Client(t *testing.T, nc net.Conn, version uint16, kind uint32, suites [
 	if err != nil {
 		return nil, err
 	}
+	if len(sf) > 0 && sf[0] == ssl2RequestCert {
+		res.certRequested = true
+		if sf[1] != ssl2AuthMD5RSA {
+			t.Fatalf("request certificate %x", sf)
+		}
+		if o.cert == nil {
+			c.writeRecord2([]byte{ssl2Error, 0, ssl2NoCertificate})
+		} else {
+			sum := md5.Sum(cat(km, sf[2:], serverCert))
+			sig, err := rsa.SignPKCS1v15(rand.Reader, o.cert.PrivateKey.(*rsa.PrivateKey), crypto.MD5, sum[:])
+			if err != nil {
+				t.Fatal(err)
+			}
+			der := o.cert.Certificate[0]
+			cc := []byte{ssl2ClientCert, 1}
+			cc = binary.BigEndian.AppendUint16(cc, uint16(len(der)))
+			cc = binary.BigEndian.AppendUint16(cc, uint16(len(sig)))
+			if err := c.writeRecord2(cat(cc, der, sig)); err != nil {
+				return nil, err
+			}
+		}
+		if sf, err = c.readRecord2(); err != nil {
+			return nil, err
+		}
+	}
+	if len(sf) == 3 && sf[0] == ssl2Error {
+		return nil, fmt.Errorf("SSL 2.0 error %x", sf)
+	}
 	if len(sf) != 17 || sf[0] != ssl2ServerFinished {
 		t.Fatalf("server finished %x", sf)
 	}
-	return c, nil
+	res.sid = sf[1:]
+	return res, nil
 }
 
 // TestSSL2: an SSL 2.0 client, with each cipher, and data echoed.

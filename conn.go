@@ -13,11 +13,13 @@
 // Everything newer belongs on crypto/tls: Wants and Frontend tell the two
 // apart from a connection's first bytes.
 //
-// Key exchange is RSA only (so the certificate's key must be RSA), with
-// AES-CBC, 3DES, DES or RC4 and the export suites.  There is no
-// resumption, renegotiation, compression or client certificate.  These
-// protocols are broken; they are here because the clients have nothing
-// else, and the traffic behind them should be treated as readable.
+// Key exchange is RSA only (so the certificates' keys must be RSA), with
+// AES-CBC, 3DES, IDEA, RC2, DES or RC4 and the export suites.  Sessions
+// resume by id (Config.SessionCache), clients may renegotiate (securely,
+// unless Config.Renegotiation says otherwise), DEFLATE compression can be
+// turned on, and clients can be asked for certificates.  These protocols
+// are broken; they are here because the clients have nothing else, and
+// the traffic behind them should be treated as readable.
 package retrossl
 
 import (
@@ -25,6 +27,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -74,7 +77,44 @@ type Config struct {
 	// SSL2Ciphers are the SSL 2.0 cipher kinds allowed, nil for all of
 	// SSL2CipherKinds().
 	SSL2Ciphers []uint32
+
+	// SessionCache keeps sessions for clients to resume; nil: none are
+	// kept, and every handshake is in full.
+	SessionCache *SessionCache
+
+	// Renegotiation is when clients may renegotiate (SSL 3.0 and TLS).
+	Renegotiation RenegotiationSupport
+
+	// Compression allows DEFLATE when the client offers it.  Off by
+	// default: compression before encryption lets an attacker who can add
+	// to the requests learn their secrets (CRIME).
+	Compression bool
+
+	// ClientAuth, ClientCAs and VerifyPeerCertificate are as crypto/tls's:
+	// whether clients are asked for certificates, which CAs verify them,
+	// and a check of the caller's own.  Clients' keys must be RSA.  SSL
+	// 2.0 clients send no chain, so their certificates' issuers must be
+	// in ClientCAs.
+	ClientAuth            tls.ClientAuthType
+	ClientCAs             *x509.CertPool
+	VerifyPeerCertificate func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 }
+
+// RenegotiationSupport is when clients may renegotiate.
+type RenegotiationSupport int
+
+const (
+	// RenegotiateSecure lets clients renegotiate that offered secure
+	// renegotiation (RFC 5746) in their first hello: most clients from
+	// 2010 on, and none before.
+	RenegotiateSecure RenegotiationSupport = iota
+	// RenegotiateNever refuses every renegotiation.
+	RenegotiateNever
+	// RenegotiateInsecure lets every client renegotiate, as servers did
+	// before 2009.  An attacker in the path can then put their own
+	// request in front of the client's (CVE-2009-3555).
+	RenegotiateInsecure
+)
 
 func (c *Config) minVersion() uint16 {
 	if c.MinVersion == 0 {
@@ -108,11 +148,14 @@ func CipherSuites() []CipherSuite {
 
 // State is a connection's, once its handshake is done.
 type State struct {
-	Version     uint16
-	CipherSuite uint32 // the SSL 3.0 / TLS 1.0 suite, or SSL 2.0's three-byte cipher kind
-	CipherName  string
-	ServerName  string // what the client asked for (TLS 1.0 only)
-	V2Hello     bool   // the client opened with an SSL 2.0-format hello
+	Version          uint16
+	CipherSuite      uint32 // the SSL 3.0 / TLS 1.0 suite, or SSL 2.0's three-byte cipher kind
+	CipherName       string
+	ServerName       string              // what the client asked for (TLS 1.0 only)
+	V2Hello          bool                // the client opened with an SSL 2.0-format hello
+	DidResume        bool                // the session was resumed
+	Compression      uint8               // 0: none; 1: DEFLATE
+	PeerCertificates []*x509.Certificate // the client's, when it sent any
 }
 
 const (
@@ -121,30 +164,36 @@ const (
 	recHandshake = 22
 	recData      = 23
 
-	hsClientHello       = 1
-	hsServerHello       = 2
-	hsCertificate       = 11
-	hsServerKeyExchange = 12
-	hsServerDone        = 14
-	hsClientKeyExchange = 16
-	hsFinished          = 20
+	hsHelloRequest       = 0
+	hsClientHello        = 1
+	hsServerHello        = 2
+	hsCertificate        = 11
+	hsServerKeyExchange  = 12
+	hsCertificateRequest = 13
+	hsServerDone         = 14
+	hsCertificateVerify  = 15
+	hsClientKeyExchange  = 16
+	hsFinished           = 20
 
 	maxPlain  = 16384
 	maxRecord = maxPlain + 2048
 	maxHSMsg  = 1 << 16
 
-	alertCloseNotify         = 0
-	alertUnexpected          = 10
-	alertBadMAC              = 20
-	alertOverflow            = 22
-	alertHandshakeFailure    = 40
-	alertIllegalParameter    = 47
-	alertDecode              = 50
-	alertDecrypt             = 51
-	alertProtocolVersion     = 70
-	alertInternal            = 80
-	alertNoRenegotiation     = 100
-	levelWarning, levelFatal = 1, 2
+	alertCloseNotify            = 0
+	alertUnexpected             = 10
+	alertBadMAC                 = 20
+	alertOverflow               = 22
+	alertHandshakeFailure       = 40
+	alertNoCertificate          = 41 // SSL 3.0's
+	alertBadCertificate         = 42
+	alertUnsupportedCertificate = 43
+	alertIllegalParameter       = 47
+	alertDecode                 = 50
+	alertDecrypt                = 51
+	alertProtocolVersion        = 70
+	alertInternal               = 80
+	alertNoRenegotiation        = 100
+	levelWarning, levelFatal    = 1, 2
 )
 
 // Conn is a connection, server side.
@@ -162,6 +211,12 @@ type Conn struct {
 
 	hs         []byte // handshake bytes read, not yet taken
 	transcript []byte // the handshake's messages so far
+
+	secureReneg                bool   // the client does RFC 5746
+	clientVerify, serverVerify []byte // the last handshake's Finished
+	renegotiating              bool
+	wantNoCert                 bool   // SSL 3.0's no_certificate alert would do
+	serverLeaf                 []byte // SSL 2.0: the certificate sent
 
 	inMu    sync.Mutex
 	in      half
@@ -303,16 +358,24 @@ func (c *Conn) readHandshake() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		switch typ {
-		case recHandshake:
+		switch {
+		case typ == recHandshake:
 			c.hs = append(c.hs, data...)
-		case recAlert:
+		case typ == recAlert && c.wantNoCert && len(data) == 2 && data[0] == levelWarning && data[1] == alertNoCertificate:
+			return nil, errNoCertificate
+		case typ == recAlert:
 			return nil, alertIn(data)
+		case typ == recData && c.renegotiating: // data may come between a renegotiation's messages
+			c.data = append(c.data, data...)
 		default:
 			return nil, fail(alertUnexpected, "record type %d in the handshake", typ)
 		}
 	}
 }
+
+// errNoCertificate: SSL 3.0's no_certificate alert, for the client's
+// Certificate.
+var errNoCertificate = errors.New("retrossl: the client has no certificate")
 
 // Handshake runs the handshake, if it hasn't run.
 func (c *Conn) Handshake() error {
@@ -361,12 +424,11 @@ func (c *Conn) Read(p []byte) (int, error) {
 				continue
 			}
 			c.readErr = alertIn(data)
-		case typ == recHandshake: // the client would renegotiate: not here
-			if c.out.version == VersionSSL30 { // which has no alert to say so
-				c.readErr = fail(alertHandshakeFailure, "the client would renegotiate")
-				c.alertFor(c.readErr)
-			} else {
-				c.sendAlert(levelWarning, alertNoRenegotiation)
+		case typ == recHandshake: // the client would renegotiate
+			c.hs = append(c.hs, data...)
+			if err := c.handleRenegotiation(); err != nil {
+				c.readErr = err
+				c.alertFor(err)
 			}
 		default:
 			c.readErr = fail(alertUnexpected, "record type %d", typ)
@@ -376,6 +438,23 @@ func (c *Conn) Read(p []byte) (int, error) {
 	n := copy(p, c.data)
 	c.data = c.data[n:]
 	return n, nil
+}
+
+// handleRenegotiation answers a client's renegotiation, as the Config
+// allows.
+func (c *Conn) handleRenegotiation() error {
+	cfg := c.cfg
+	if cfg.Renegotiation == RenegotiateNever || (!c.secureReneg && cfg.Renegotiation != RenegotiateInsecure) {
+		c.hs = nil
+		if c.out.version == VersionSSL30 { // which has no alert to say no
+			return fail(alertHandshakeFailure, "the client would renegotiate, which is off")
+		}
+		c.sendAlert(levelWarning, alertNoRenegotiation)
+		return nil
+	}
+	c.hsMu.Lock()
+	defer c.hsMu.Unlock()
+	return c.renegotiate()
 }
 
 // Write writes application data.
