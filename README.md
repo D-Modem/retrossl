@@ -84,10 +84,11 @@ check the mark, since it only falls back when the newer protocol is off.
 
 ## Testing
 
-`go test ./...` runs Go's own TLS client at TLS 1.0, and in-test clients for
+`make test` (gofmt, vet, then `go test -race ./...`) runs Go's own TLS client at TLS 1.0, and in-test clients for
 SSL 3.0 and TLS 1.0 (both hello formats, every suite) and SSL 2.0 (every
 cipher). The in-test clients follow the specifications, but they share the
-package's record code, so trying real old clients is still worth doing.
+package's record code, so trying real old clients is still worth doing. `make cover`
+writes the tests' coverage to `cover.html`.
 
 ## Where it comes from
 
