@@ -27,108 +27,36 @@ bytes of a connection and sends it to the applicable server.
 clients have no other protocols. Each person on the path can possibly
 read the traffic behind them. Tell the users about this risk.
 
-## Use
+## Quick start
+
+You must have Go 1.26 or later.
+
+    go get github.com/D-Modem/retrossl
 
 ```go
 import "github.com/D-Modem/retrossl"
 
 rc := &retrossl.Config{
-	GetCertificate: getCert,             // an RSA certificate
+	GetCertificate: getCert,               // an RSA certificate
 	MinVersion:     retrossl.VersionSSL20, // 0: SSL 3.0 and up
 }
 conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 c, err := retrossl.Frontend(conn, tlsConfig, rc) // a *retrossl.Conn or a *tls.Conn
 ```
 
-`retrossl.Server(conn, rc)` serves a connection with retrossl, for all
-types of hello. `retrossl.Wants(firstBytes)` or `retrossl.Sniff(bufReader)`
-tell if retrossl must accept the connection. retrossl accepts an SSL
-2.0-format hello, or a record hello that offers a maximum of SSL 3.0.
-TLS 1.0 record hellos go to `crypto/tls`. Thus, to serve those clients,
-set the `MinVersion` of `crypto/tls` to `tls.VersionTLS10`.
+The export suites must have 512-bit RSA keys. To let Go use them, put
+`//go:debug rsa1024min=0` in the main package. Refer to
+[Usage](docs/usage.md).
 
-A `*retrossl.Conn` is a `net.Conn`. After the handshake, `ConnectionState()`
-gives the version, the cipher and the server name.
+## Documentation
 
-**Export suites must have small keys.** Their temporary RSA keys are 512
-bits (1024 for the 56-bit suites). Go refuses these keys, unless the
-program lets it use them. Put this line in the main package:
+- [Usage](docs/usage.md): `Frontend`, `Server`, `Wants` and `Sniff`, and the export suites
+- [What it does](docs/features.md): the versions, suites, resumption, renegotiation, compression and client certificates
+- [Testing](docs/testing.md): `make test` and the in-test clients
+- [Where it comes from](docs/origin.md): the origin of the code, and its specifications
+- [Documentation style](docs/STYLE.md): the rules for ASD-STE100 Simplified Technical English
 
-```go
-//go:debug rsa1024min=0
-```
+## Licence
 
-Alternatively, put `godebug rsa1024min=0` in its `go.mod`. Without this
-setting, retrossl does not offer the 40-bit suites. It refuses clients
-that offer only these suites.
-
-## What it does
-
-| | |
-|---|---|
-| Versions | SSL 2.0 (disabled unless `MinVersion` is `VersionSSL20`), SSL 3.0, TLS 1.0 |
-| Key exchange | RSA. For export suites, a signed temporary key if the key of the certificate is larger than the suites permit |
-| SSL 3.0 / TLS 1.0 suites | AES-128 and AES-256 CBC, 3DES, RC4-SHA, RC4-MD5, IDEA, DES, EXP1024-RC4-SHA, EXP1024-DES, EXP-RC4-MD5, EXP-RC2-CBC-MD5, EXP-DES40 |
-| SSL 2.0 ciphers | DES-EDE3-CBC, RC4-128, IDEA-CBC, RC2-CBC, DES-CBC, RC4-128-EXPORT40, RC2-CBC-EXPORT40 (all with MD5) |
-| Session resumption | by session id, for all three versions, with `Config.SessionCache = retrossl.NewSessionCache(size, ttl)` |
-| Renegotiation | started by the client, or requested with `Conn.RequestRenegotiation()` (SSL 3.0 and TLS). Refer to the text below |
-| Compression | DEFLATE (RFC 3749), if `Config.Compression` is set |
-| Client certificates | `Config.ClientAuth`, `ClientCAs` and `VerifyPeerCertificate`, as in `crypto/tls`, for all three versions (RSA keys) |
-| Extensions | `renegotiation_info` (RFC 5746), and retrossl reads the server name |
-
-**Renegotiation** is secure by default. Clients that offered RFC 5746 in
-their first hello (most clients from 2010 and after) can renegotiate.
-retrossl refuses renegotiation from other clients. `RenegotiateInsecure`
-lets all clients renegotiate, as servers did before 2009. But this lets
-an attacker on the path put their own request in front of the request of
-the client (CVE-2009-3555). `RenegotiateNever` refuses all renegotiation.
-
-**Compression** is disabled by default. If a server compresses data
-before it encrypts the data, an attacker who can add to the requests of
-a client can learn its secrets, for example cookies (CRIME). Also, few
-old clients offered compression. Most of these clients used OpenSSL.
-
-**Client certificates** from SSL 2.0 clients come without a chain. Thus
-their issuer must be in `ClientCAs`. A resumed session keeps the
-certificate of the client from its first handshake.
-
-**SSL 2.0 sends only the certificate of the server**, not its chain. Thus
-an SSL 2.0 client must trust that certificate or its direct issuer. The
-CA of the D-Modem BBS signs its sites with a sub-CA. Thus, SSL 2.0
-clients must have the sub-CA installed, not only the root.
-
-A client can offer SSL 3.0 or TLS in an SSL 2.0-format hello, but with a
-version or ciphers that retrossl does not serve. If SSL 2.0 is enabled,
-such a client gets SSL 2.0. These clients put a mark in their SSL 2.0 key
-exchange to detect a downgrade. retrossl does not check the mark, because
-it falls back only when the newer protocol is disabled.
-
-## Testing
-
-`make test` runs gofmt, vet, then `go test -race ./...`. The tests use
-these clients:
-
-- The TLS client of Go, at TLS 1.0.
-- In-test clients for SSL 3.0 and TLS 1.0 (the two hello formats, all
-  suites).
-- An in-test client for SSL 2.0 (all ciphers).
-
-The tests include resumption, renegotiation, compression and client
-certificates. The tests check IDEA against its published test vector,
-RC2 against OpenSSL, and the decompressor against records that zlib
-compressed. The in-test clients follow the specifications. But they use
-the same record code as the package. Thus it is still useful to test
-with real old clients. `make cover` writes the coverage of the tests to
-`cover.html`.
-
-## Where it comes from
-
-The TLS 1.0 server started as the `internal/oldtls` package of the
-D-Modem BBS. The D-Modem authors release it here under the BSD 3-Clause
-licence (refer to [LICENSE](LICENSE)). Thus BSD-licensed programs, for
-example WebOne-go, can use it. We wrote SSL 3.0, SSL 2.0 and the export
-suites from the specifications of the protocols: the SSL 3.0 draft
-(RFC 6101), the SSL 2.0 draft, RFC 2246, RFC 3749, RFC 5746 and the
-56-bit export draft. We wrote IDEA from its paper. RC2 (`internal/rc2`)
-is a copy from `golang.org/x/crypto` of Go, under its BSD licence
-(`internal/rc2/LICENSE`), because x/crypto keeps it internal.
+BSD 3-Clause ([LICENSE](LICENSE)). `internal/rc2` is a copy from
+`golang.org/x/crypto`, under its BSD licence (`internal/rc2/LICENSE`).
