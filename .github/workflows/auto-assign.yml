@@ -1,0 +1,26 @@
+# Auto-assign new issues.
+#
+# This workflow starts when a person opens an issue.
+# It adds the project owner (Neo-Desktop) as an assignee.
+# To change the assignee, change the ASSIGNEE value below.
+name: Auto-assign issues
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  # Add the assignee to the issue that started this run.
+  assign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add assignee
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSIGNEE: Neo-Desktop
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: gh issue edit "$ISSUE" --repo "$REPO" --add-assignee "$ASSIGNEE"
